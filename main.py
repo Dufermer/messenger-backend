@@ -1,40 +1,31 @@
 ﻿from fastapi import FastAPI, Depends, HTTPException, WebSocket, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship, Session
+from sqlalchemy.orm import sessionmaker, Session
 from datetime import datetime, timedelta
-from typing import Optional
-import hashlib
-import base64
+import hashlib, base64
 from apscheduler.schedulers.asyncio import AsyncScheduler
 from contextlib import asynccontextmanager
 
-# === ENCRYPTION ===
-ENCRYPTION_KEY = hashlib.sha256(b"messenger_secret_key_2026").digest()  # В продакшене - из env!
+# === КОНФИГУРАЦИЯ ===
+ENCRYPTION_KEY = hashlib.sha256(b"gramofon_secret_2026").digest()
+APP_VERSION = "1.0.0"  # Увеличивай при каждом обновлении!
 
-def encrypt_message(message: str) -> str:
-    """Простое XOR шифрование (для MVP)"""
-    key_bytes = ENCRYPTION_KEY
-    message_bytes = message.encode('utf-8')
-    encrypted = bytes([message_bytes[i] ^ key_bytes[i % len(key_bytes)] for i in range(len(message_bytes))])
-    return base64.b64encode(encrypted).decode('utf-8')
+def encrypt_message(msg: str) -> str:
+    enc = bytes([msg.encode('utf-8')[i] ^ ENCRYPTION_KEY[i % len(ENCRYPTION_KEY)] for i in range(len(msg.encode('utf-8')))])
+    return base64.b64encode(enc).decode('utf-8')
 
-def decrypt_message(encrypted: str) -> str:
-    """Расшифровка"""
-    key_bytes = ENCRYPTION_KEY
-    encrypted_bytes = base64.b64decode(encrypted.encode('utf-8'))
-    decrypted = bytes([encrypted_bytes[i] ^ key_bytes[i % len(key_bytes)] for i in range(len(encrypted_bytes))])
-    return decrypted.decode('utf-8')
+def decrypt_message(enc: str) -> str:
+    dec = bytes([base64.b64decode(enc)[i] ^ ENCRYPTION_KEY[i % len(ENCRYPTION_KEY)] for i in range(len(base64.b64decode(enc)))])
+    return dec.decode('utf-8')
 
-# === DATABASE ===
-SQLALCHEMY_DATABASE_URL = "sqlite:///./messenger.db"
+SQLALCHEMY_DATABASE_URL = "sqlite:///./gramofon.db"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# === MODELS ===
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -46,185 +37,79 @@ class Message(Base):
     id = Column(Integer, primary_key=True, index=True)
     sender_id = Column(Integer, ForeignKey("users.id"))
     receiver_id = Column(Integer, ForeignKey("users.id"))
-    content_encrypted = Column(String)  # Зашифрованный контент
+    content_encrypted = Column(String)
     timestamp = Column(DateTime, default=datetime.utcnow)
-    delete_at = Column(DateTime, nullable=True)  # Когда удалить
-    read_at = Column(DateTime, nullable=True)    # Когда прочитано
+    delete_at = Column(DateTime, nullable=True)
     is_deleted = Column(Boolean, default=False)
 
 Base.metadata.create_all(bind=engine)
 
-# === LIFESPAN ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Запуск планировщика при старте
     scheduler.start()
     yield
-    # Остановка при завершении
     scheduler.shutdown()
 
-app = FastAPI(title="Secure Messenger", lifespan=lifespan)
+app = FastAPI(title="Gramofon Backend", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# === SCHEDULER ===
 scheduler = AsyncScheduler()
-
-async def cleanup_expired_messages():
-    """Удаляет истекшие сообщения"""
+async def cleanup():
     db = SessionLocal()
     try:
-        now = datetime.utcnow()
-        expired = db.query(Message).filter(
-            Message.delete_at <= now,
-            Message.is_deleted == False
-        ).all()
-        
-        for msg in expired:
-            msg.is_deleted = True
-            # Опционально: удаляем контент
-            msg.content_encrypted = None
-        
+        expired = db.query(Message).filter(Message.delete_at <= datetime.utcnow(), Message.is_deleted == False).all()
+        for m in expired: m.is_deleted = True; m.content_encrypted = None
         db.commit()
-        print(f"🗑️ Удалено {len(expired)} сообщений")
-    finally:
-        db.close()
+    finally: db.close()
+scheduler.add_job(cleanup, 'interval', minutes=1)
 
-# Запускаем проверку каждые 5 минут
-scheduler.add_job(cleanup_expired_messages, 'interval', minutes=5)
-
-# === DEPENDENCIES ===
 def get_db():
     db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    try: yield db
+    finally: db.close()
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def authenticate_user(db: Session, username: str, password: str):
-    user = db.query(User).filter(User.username == username).first()
-    if not user or user.hashed_password != hash_password(password):
-        return None
-    return user
-
-# === ROUTES ===
 @app.post("/register")
 async def register(username: str, password: str, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.username == username).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="User exists")
-    
-    new_user = User(username=username, hashed_password=hash_password(password))
-    db.add(new_user)
+    if db.query(User).filter(User.username == username).first():
+        raise HTTPException(400, "User exists")
+    db.add(User(username=username, hashed_password=hashlib.sha256(password.encode()).hexdigest()))
     db.commit()
-    return {"message": "Created", "username": username}
+    return {"status": "ok"}
 
 @app.post("/token")
-async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = authenticate_user(db, form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    return {"access_token": str(user.id), "token_type": "bearer"}
+async def login(username: str, password: str, db: Session = Depends(get_db)):
+    u = db.query(User).filter(User.username == username, User.hashed_password == hashlib.sha256(password.encode()).hexdigest()).first()
+    if not u: raise HTTPException(401, "Invalid")
+    return {"access_token": str(u.id), "token_type": "bearer"}
 
 @app.get("/users")
 async def get_users(db: Session = Depends(get_db)):
-    users = db.query(User).all()
-    return [{"id": u.id, "username": u.username} for u in users]
+    return [{"id": u.id, "username": u.username} for u in db.query(User).all()]
 
-@app.get("/messages/{sender}/{receiver}")
-async def get_messages(sender: int, receiver: int, db: Session = Depends(get_db)):
-    """Получить историю сообщений (расшифрованную)"""
-    messages = db.query(Message).filter(
-        ((Message.sender_id == sender) & (Message.receiver_id == receiver)) |
-        ((Message.sender_id == receiver) & (Message.receiver_id == sender))
-    ).filter(Message.is_deleted == False).order_by(Message.timestamp).all()
-    
-    result = []
-    for msg in messages:
-        decrypted = decrypt_message(msg.content_encrypted) if msg.content_encrypted else "[DELETED]"
-        result.append({
-            "id": msg.id,
-            "sender_id": msg.sender_id,
-            "content": decrypted,
-            "timestamp": msg.timestamp.isoformat(),
-            "delete_at": msg.delete_at.isoformat() if msg.delete_at else None,
-            "is_deleted": msg.is_deleted
-        })
-    return result
+@app.get("/api/version")
+async def get_version():
+    return {"version": APP_VERSION, "apk_url": "/static/gramofon.apk"}
 
-@app.post("/messages/{user_id}/read")
-async def mark_as_read(message_id: int, user_id: int, db: Session = Depends(get_db)):
-    """Отметить как прочитанное и запустить таймер удаления"""
-    msg = db.query(Message).filter(Message.id == message_id).first()
-    if not msg:
-        raise HTTPException(status_code=404, detail="Not found")
-    
-    if not msg.read_at:  # Первый раз открыли
-        msg.read_at = datetime.utcnow()
-        # Таймер 5 минут по умолчанию
-        msg.delete_at = msg.read_at + timedelta(minutes=5)
-        db.commit()
-    
-    return {"status": "ok", "delete_at": msg.delete_at.isoformat()}
-
-# === WEBSOCKET ===
-active_connections: dict = {}
-
+active_ws = {}
 @app.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: int, db: Session = Depends(get_db)):
+async def ws_endpoint(websocket: WebSocket, user_id: int, db: Session = Depends(get_db)):
     await websocket.accept()
-    active_connections[user_id] = websocket
-    
+    active_ws[user_id] = websocket
     try:
         while True:
-            data = await websocket.receive_text()
-            # Формат: "receiver_id:content:delete_minutes"
-            parts = data.split(":", 2)
-            if len(parts) != 3:
-                continue
-            
-            receiver_id = int(parts[0])
-            content = parts[1]
-            delete_minutes = int(parts[2]) if parts[2] else 5  # 5 мин по умолчанию
-            
-            # Шифруем
-            encrypted = encrypt_message(content)
-            
-            # Сохраняем
-            msg = Message(
-                sender_id=user_id,
-                receiver_id=receiver_id,
-                content_encrypted=encrypted,
-                delete_at=datetime.utcnow() + timedelta(minutes=delete_minutes) if delete_minutes > 0 else None
-            )
-            db.add(msg)
-            db.commit()
-            
-            # Отправляем получателю
-            if receiver_id in active_connections:
-                try:
-                    await active_connections[receiver_id].send_text(
-                        f"{user_id}:{msg.id}:{encrypted}:{delete_minutes}"
-                    )
-                except:
-                    pass
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-    finally:
-        active_connections.pop(user_id, None)
+            raw = await websocket.receive_text()
+            parts = raw.split(":", 2)
+            if len(parts) != 3: continue
+            recv_id, content, _ = int(parts[0]), parts[1], 2  # 🔒 ВСЕГДА 2 МИНУТЫ
+            enc = encrypt_message(content)
+            msg = Message(sender_id=user_id, receiver_id=recv_id, content_encrypted=enc, delete_at=datetime.utcnow() + timedelta(minutes=2))
+            db.add(msg); db.commit()
+            if recv_id in active_ws:
+                try: await active_ws[recv_id].send_text(f"{user_id}:{msg.id}:{enc}")
+                except: pass
+    except: pass
+    finally: active_ws.pop(user_id, None)
 
 @app.get("/")
-async def root():
-    return {"message": "Secure Messenger API", "docs": "/docs"}
+async def root(): return {"app": "Gramofon", "version": APP_VERSION}
